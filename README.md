@@ -12,14 +12,14 @@ This is the **single-worker proof of concept**. Once this loop survives a crash 
 ## 2. Set up the Render API
 
 1. In Render, create a new Web Service pointing at this repo (it will pick up `render.yaml` automatically).
-2. In the Render dashboard, set these environment variables (they're marked `sync: false` in `render.yaml` so Render will prompt you):
-   - `TIDB_HOST`, `TIDB_USER`, `TIDB_PASSWORD`, `TIDB_DATABASE` (and `TIDB_PORT` if it's not 4000)
+2. In the Render dashboard, set the one environment variable `render.yaml` marks `sync: false` so Render will prompt you for it:
+   - `TIDB_CONNECTION_STRING` — paste the full connection string from TiDB Cloud's **Connect** panel (e.g. `mysql://user.root:password@gateway01...tidbcloud.com:4000/hoster?ssl-mode=VERIFY_IDENTITY`).
 3. Deploy. Once it's live, check `GET /health` — it should return `{"ok": true, "workers_ready": 0, "pending_jobs": 0}`.
 
 ## 3. Set up the GitHub Actions worker
 
-1. In this repo: **Settings → Secrets and variables → Actions**, add:
-   - `TIDB_HOST`, `TIDB_PORT`, `TIDB_USER`, `TIDB_PASSWORD`, `TIDB_DATABASE`
+1. In this repo: **Settings → Secrets and variables → Actions**, add one secret:
+   - `TIDB_CONNECTION_STRING` — the same full string you gave Render.
 2. Go to the **Actions** tab, select **Hoster Worker**, and click **Run workflow** to trigger it manually (don't wait for the daily cron while testing).
 3. Watch the logs — you should see the model download, "worker ready, entering poll loop", and then it will sit polling since there are no jobs yet.
 
