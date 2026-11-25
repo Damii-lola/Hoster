@@ -1,0 +1,31 @@
+name: Hoster Worker
+
+on:
+  workflow_dispatch: {}   # lets you trigger it manually from the Actions tab for testing
+  schedule:
+    - cron: "0 0 * * *"   # Phase 1: one run a day. Add more entries + repos once this loop is proven.
+
+jobs:
+  worker:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300   # 5 hours — safely under GitHub's 6-hour hard limit
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r worker/requirements.txt
+
+      - name: Run worker
+        env:
+          TIDB_HOST: ${{ secrets.TIDB_HOST }}
+          TIDB_PORT: ${{ secrets.TIDB_PORT }}
+          TIDB_USER: ${{ secrets.TIDB_USER }}
+          TIDB_PASSWORD: ${{ secrets.TIDB_PASSWORD }}
+          TIDB_DATABASE: ${{ secrets.TIDB_DATABASE }}
+          WORKER_ID: "gha-worker-1"
+          MAX_RUNTIME_SECONDS: "17700"
+        run: python worker/worker.py
