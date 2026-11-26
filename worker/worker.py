@@ -2,19 +2,25 @@
 Hoster worker — runs inside a GitHub Actions job.
 
 What it does, in order:
-  1. Registers itself in the `workers` table and starts heartbeating.
-  2. Downloads + loads a quantized Qwen2.5-7B-Instruct GGUF model (cached
-     on disk for this run so repeated jobs don't reload it).
+  1. Registers itself in the `workers` table.
+  2. Downloads + loads a quantized Qwen2.5-7B-Instruct GGUF model.
   3. Loops: reclaims any stale/abandoned jobs, claims one pending job,
      runs inference, writes the result back.
   4. Stops claiming new jobs a safety margin before the runner's time
      limit and shuts down cleanly.
 
+Every database call opens its own short-lived connection rather than
+holding one open for the worker's whole lifetime. This matters because
+TiDB (like most managed MySQL-compatible services) closes connections
+that sit idle too long — and the ~45 minutes a cold model download can
+take is far longer than that idle timeout. One connection held open
+across the download would already be dead by the time it's used again.
+
 Required environment variables (set as GitHub Actions secrets):
-    TIDB_HOST, TIDB_PORT, TIDB_USER, TIDB_PASSWORD, TIDB_DATABASE
+    TIDB_CONNECTION_STRING   (or the individual TIDB_HOST/PORT/USER/PASSWORD/DATABASE — see db.py)
 
 Optional:
-    WORKER_ID             defaults to "gha-" + a short random id
+    WORKER_ID              defaults to "gha-" + a short random id
     MAX_RUNTIME_SECONDS    defaults to 17700 (4h55m) — keep under GitHub's 6h cap
     LEASE_SECONDS          defaults to 600 (10 min) — how long a claimed job
                            is considered "alive" before another worker may
@@ -27,6 +33,8 @@ import time
 import uuid
 import signal
 import traceback
+
+os.environ.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "1")  # much faster model download
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from db import get_connection  # noqa: E402
@@ -50,6 +58,26 @@ def _handle_sigterm(signum, frame):
 
 signal.signal(signal.SIGTERM, _handle_sigterm)
 signal.signal(signal.SIGINT, _handle_sigterm)
+
+
+def _run(fn, *args, retries=2):
+    """Open a fresh connection, run fn(conn, *args), close it. Retries
+    once on a dropped-connection error, since that's the one failure
+    mode we expect from an idle/long-lived link, not from bad queries."""
+    last_exc = None
+    for attempt in range(retries + 1):
+        conn = get_connection()
+        try:
+            return fn(conn, *args)
+        except Exception as exc:  # noqa: BLE001
+            last_exc = exc
+            print(f"[{WORKER_ID}] db call failed (attempt {attempt + 1}): {exc}", flush=True)
+        finally:
+            try:
+                conn.close()
+            except Exception:  # noqa: BLE001
+                pass
+    raise last_exc
 
 
 def download_model():
@@ -76,7 +104,7 @@ def load_model(path):
     return llm
 
 
-def register_worker(conn):
+def _register_worker(conn):
     with conn.cursor() as cur:
         cur.execute(
             """
@@ -93,7 +121,7 @@ def register_worker(conn):
         )
 
 
-def set_worker_status(conn, status, current_job_id=None):
+def _set_worker_status(conn, status, current_job_id):
     with conn.cursor() as cur:
         cur.execute(
             "UPDATE workers SET status = %s, current_job_id = %s, "
@@ -102,7 +130,7 @@ def set_worker_status(conn, status, current_job_id=None):
         )
 
 
-def heartbeat(conn):
+def _heartbeat(conn):
     with conn.cursor() as cur:
         cur.execute(
             "UPDATE workers SET last_heartbeat = CURRENT_TIMESTAMP WHERE worker_id = %s",
@@ -110,9 +138,7 @@ def heartbeat(conn):
         )
 
 
-def reclaim_stale_jobs(conn):
-    """Any job stuck in 'processing' past its lease is returned to the
-    queue (or marked failed if it has used up its retry budget)."""
+def _reclaim_stale_jobs(conn):
     with conn.cursor() as cur:
         cur.execute(
             "UPDATE jobs SET status = 'pending', claimed_by = NULL "
@@ -127,8 +153,7 @@ def reclaim_stale_jobs(conn):
         )
 
 
-def claim_one_job(conn):
-    """Atomically claim a single pending job for this worker's model."""
+def _claim_one_job(conn):
     with conn.cursor() as cur:
         cur.execute(
             "SELECT id FROM jobs WHERE status = 'pending' AND model_name = %s "
@@ -151,10 +176,11 @@ def claim_one_job(conn):
     return None
 
 
-def fetch_job_input(conn, job_id):
+def _fetch_job_input(conn, job_id):
     with conn.cursor() as cur:
         cur.execute("SELECT input FROM jobs WHERE id = %s", (job_id,))
-        return cur.fetchone()["input"]
+        row = cur.fetchone()
+        return row["input"] if row else None
 
 
 def run_inference(llm, prompt_text):
@@ -163,7 +189,7 @@ def run_inference(llm, prompt_text):
     return out["choices"][0]["message"]["content"]
 
 
-def complete_job(conn, job_id, result_text):
+def _complete_job(conn, job_id, result_text):
     with conn.cursor() as cur:
         cur.execute(
             "UPDATE jobs SET status = 'done', result = %s WHERE id = %s",
@@ -171,7 +197,7 @@ def complete_job(conn, job_id, result_text):
         )
 
 
-def fail_job(conn, job_id, error_text):
+def _fail_job(conn, job_id, error_text):
     with conn.cursor() as cur:
         cur.execute(
             "SELECT attempt_count, max_attempts FROM jobs WHERE id = %s", (job_id,)
@@ -190,14 +216,24 @@ def fail_job(conn, job_id, error_text):
             )
 
 
+def _bump_counter(conn, column):
+    with conn.cursor() as cur:
+        cur.execute(
+            f"UPDATE workers SET {column} = {column} + 1 WHERE worker_id = %s",
+            (WORKER_ID,),
+        )
+
+
 def main():
     start_time = time.time()
-    conn = get_connection()
-    register_worker(conn)
+    _run(_register_worker)
 
+    # No DB connection is held open across this step on purpose — it can
+    # take a long time, and a connection left idle that long gets dropped.
     model_path = download_model()
     llm = load_model(model_path)
-    set_worker_status(conn, "ready")
+
+    _run(_set_worker_status, "ready", None)
     print(f"[{WORKER_ID}] worker ready, entering poll loop", flush=True)
 
     poll_interval = 2
@@ -210,43 +246,37 @@ def main():
                 print(f"[{WORKER_ID}] approaching time budget, shutting down", flush=True)
                 break
 
-            heartbeat(conn)
-            reclaim_stale_jobs(conn)
+            _run(_heartbeat)
+            _run(_reclaim_stale_jobs)
 
-            job_id = claim_one_job(conn)
+            job_id = _run(_claim_one_job)
             if job_id is None:
                 time.sleep(poll_interval)
                 poll_interval = min(poll_interval * 2, max_poll_interval)
                 continue
 
             poll_interval = 2  # reset backoff — we found work
-            set_worker_status(conn, "busy", job_id)
+            _run(_set_worker_status, "busy", job_id)
             print(f"[{WORKER_ID}] claimed job {job_id}", flush=True)
 
             try:
-                prompt_text = fetch_job_input(conn, job_id)
+                prompt_text = _run(_fetch_job_input, job_id)
                 result_text = run_inference(llm, prompt_text)
-                complete_job(conn, job_id, result_text)
+                _run(_complete_job, job_id, result_text)
                 print(f"[{WORKER_ID}] completed job {job_id}", flush=True)
-                with conn.cursor() as cur:
-                    cur.execute(
-                        "UPDATE workers SET jobs_completed = jobs_completed + 1 "
-                        "WHERE worker_id = %s", (WORKER_ID,)
-                    )
+                _run(_bump_counter, "jobs_completed")
             except Exception as exc:  # noqa: BLE001
                 print(f"[{WORKER_ID}] job {job_id} failed: {exc}", flush=True)
                 traceback.print_exc()
-                fail_job(conn, job_id, str(exc)[:500])
-                with conn.cursor() as cur:
-                    cur.execute(
-                        "UPDATE workers SET jobs_failed = jobs_failed + 1 "
-                        "WHERE worker_id = %s", (WORKER_ID,)
-                    )
+                _run(_fail_job, job_id, str(exc)[:500])
+                _run(_bump_counter, "jobs_failed")
             finally:
-                set_worker_status(conn, "ready")
+                _run(_set_worker_status, "ready", None)
     finally:
-        set_worker_status(conn, "offline")
-        conn.close()
+        try:
+            _run(_set_worker_status, "offline", None)
+        except Exception:  # noqa: BLE001
+            pass
         print(f"[{WORKER_ID}] shut down cleanly", flush=True)
 
 
