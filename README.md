@@ -64,6 +64,28 @@ If that works, the core loop is proven and we move on to:
 - quantizing/benchmarking the model properly,
 - and the monitoring/security layers we discussed.
 
+## Phase 2A — performance intelligence
+
+Run `schema_phase2_metrics.sql` once (after `schema.sql`) to add the metrics columns and the `worker_runs` table.
+
+Every completed job now records: queue wait time, inference time, total time, CPU time, CPU utilization %, peak memory, input/output size, exact model file, and the `max_tokens` used. Every worker boot records: download time, load time, total startup time, and whether the model came from GitHub's cache.
+
+- **Per-job detail:** `GET /result/<job_id>` now returns a `metrics` object alongside the result.
+- **Aggregate benchmarks:** `GET /metrics` returns averages across every completed job and every worker boot, grouped by exact model file — this is the actual benchmark table from the original plan, built automatically instead of by hand.
+
+One honest caveat: `peak_rss_mb` is the whole worker *process's* peak memory at that moment, not memory isolated to one job — a single long-lived process loading one model can't cleanly separate "this job's RAM" from "the model's RAM," so treat it as a per-worker ceiling (dominated by the model weights) rather than a per-request cost.
+
+### Making responses faster — what actually matters, in order
+
+Based on what CPU inference actually costs (and what Phase 2A will let you confirm with your own numbers once you have a few dozen completed jobs):
+
+1. **`max_tokens` is the single biggest lever you control per request.** Generation time scales roughly linearly with tokens generated — asking for 500 tokens takes roughly 5x as long as asking for 100. `POST /run-ai` now accepts `"max_tokens": 80` (or whatever you want, up to 2048) in the request body; the server defaults to 300 if you don't send one. For anything latency-sensitive, send a small number explicitly rather than relying on the default.
+2. **Model size dominates everything else.** `MODEL_REPO`/`MODEL_FILE`/`MODEL_NAME` are all environment variables on the worker — swapping to a smaller Qwen (e.g. a 3B or 1.5B variant) instead of 7B would likely cut inference time several-fold, at some quality cost. Don't guess at this trade-off — run a few jobs against each size and compare `avg_inference_seconds` from `/metrics` before deciding.
+3. **Cold start is now mostly solved** (model caching + `hf_transfer`), so it shouldn't be where your time is going anymore — `/metrics`'s `worker_startup_benchmarks` will confirm whether that's still true for you.
+4. **CPU thread count is already near-optimal** for this runner (`n_threads`/`n_threads_batch` both set to the actual core count) — there isn't much more to extract here without a different runner entirely.
+
+In short: if a response feels slow, check `/metrics` first to see whether it's generation length, model size, or something unexpected (e.g. queue wait from no worker being active) — then fix that specific thing instead of tuning blind.
+
 ## Notes / known limits of this phase-1 version
 
 - One worker, one model, no dashboard yet — this is intentionally minimal.

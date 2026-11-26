@@ -2,29 +2,30 @@
 Hoster worker — runs inside a GitHub Actions job.
 
 What it does, in order:
-  1. Registers itself in the `workers` table.
-  2. Downloads + loads a quantized Qwen2.5-7B-Instruct GGUF model.
+  1. Registers itself in the `workers` table and logs a `worker_runs` row.
+  2. Downloads + loads a quantized Qwen2.5-7B-Instruct GGUF model,
+     timing both steps and detecting whether the model came from cache.
   3. Loops: reclaims any stale/abandoned jobs, claims one pending job,
-     runs inference, writes the result back.
+     runs inference while recording timing/resource metrics, writes the
+     result + those metrics back.
   4. Stops claiming new jobs a safety margin before the runner's time
-     limit and shuts down cleanly.
+     limit, finalizes its `worker_runs` row, and shuts down cleanly.
 
 Every database call opens its own short-lived connection rather than
-holding one open for the worker's whole lifetime. This matters because
-TiDB (like most managed MySQL-compatible services) closes connections
-that sit idle too long — and the ~45 minutes a cold model download can
-take is far longer than that idle timeout. One connection held open
-across the download would already be dead by the time it's used again.
+holding one open for the worker's whole lifetime — TiDB closes
+connections that sit idle too long, and a cold model download can take
+far longer than that idle timeout.
 
 Required environment variables (set as GitHub Actions secrets):
     TIDB_CONNECTION_STRING   (or the individual TIDB_HOST/PORT/USER/PASSWORD/DATABASE — see db.py)
 
 Optional:
-    WORKER_ID              defaults to "gha-" + a short random id
-    MAX_RUNTIME_SECONDS    defaults to 17700 (4h55m) — keep under GitHub's 6h cap
-    LEASE_SECONDS          defaults to 600 (10 min) — how long a claimed job
-                           is considered "alive" before another worker may
-                           reclaim it
+    WORKER_ID                      defaults to "gha-" + a short random id
+    MAX_RUNTIME_SECONDS            defaults to 17700 (4h55m) — keep under GitHub's 6h cap
+    LEASE_SECONDS                  defaults to 90 — how long a claimed job is
+                                    considered "alive" without a renewal
+    LEASE_RENEWAL_INTERVAL_SECONDS defaults to 30 — how often an in-progress
+                                    job's lease is pushed forward
 """
 
 import os
@@ -32,6 +33,7 @@ import sys
 import time
 import uuid
 import signal
+import resource
 import threading
 import traceback
 
@@ -43,6 +45,7 @@ from db import get_connection  # noqa: E402
 MODEL_REPO = os.environ.get("MODEL_REPO", "bartowski/Qwen2.5-7B-Instruct-GGUF")
 MODEL_FILE = os.environ.get("MODEL_FILE", "Qwen2.5-7B-Instruct-Q4_K_M.gguf")
 MODEL_NAME = os.environ.get("MODEL_NAME", "Qwen/Qwen2.5-7B-Instruct")
+DEFAULT_MAX_TOKENS = int(os.environ.get("DEFAULT_MAX_TOKENS", 300))
 
 WORKER_ID = os.environ.get("WORKER_ID", f"gha-{uuid.uuid4().hex[:8]}")
 MAX_RUNTIME_SECONDS = int(os.environ.get("MAX_RUNTIME_SECONDS", 17700))
@@ -50,14 +53,13 @@ MAX_RUNTIME_SECONDS = int(os.environ.get("MAX_RUNTIME_SECONDS", 17700))
 # How long a claimed job is considered "alive" without a renewal before
 # another worker may reclaim it. Short on purpose: as long as this worker
 # is actually still processing, it renews the lease well before this
-# expires (see LEASE_RENEWAL_INTERVAL_SECONDS below), so a genuinely slow
-# job is never wrongly reclaimed. If the worker dies, renewals stop and
-# the job becomes reclaimable after this many seconds — not after some
-# long fixed timeout regardless of what actually happened.
+# expires, so a genuinely slow job is never wrongly reclaimed. If the
+# worker dies, renewals stop and the job becomes reclaimable quickly.
 LEASE_SECONDS = int(os.environ.get("LEASE_SECONDS", 90))
 LEASE_RENEWAL_INTERVAL_SECONDS = int(os.environ.get("LEASE_RENEWAL_INTERVAL_SECONDS", 30))
 
 SHUTDOWN_MARGIN_SECONDS = 300  # stop claiming new jobs this long before the hard cutoff
+CPU_COUNT = os.cpu_count() or 4
 
 _stop_requested = False
 
@@ -92,27 +94,38 @@ def _run(fn, *args, retries=2):
 
 
 def download_model():
-    from huggingface_hub import hf_hub_download
+    from huggingface_hub import hf_hub_download, try_to_load_from_cache
+
+    cached_path = try_to_load_from_cache(MODEL_REPO, MODEL_FILE)
+    cache_hit = isinstance(cached_path, str)
 
     print(f"[{WORKER_ID}] downloading {MODEL_FILE} from {MODEL_REPO} ...", flush=True)
+    t0 = time.time()
     path = hf_hub_download(repo_id=MODEL_REPO, filename=MODEL_FILE)
-    print(f"[{WORKER_ID}] model ready at {path}", flush=True)
-    return path
+    download_seconds = time.time() - t0
+    print(
+        f"[{WORKER_ID}] model ready at {path} "
+        f"({download_seconds:.1f}s, cache_hit={cache_hit})",
+        flush=True,
+    )
+    return path, download_seconds, cache_hit
 
 
 def load_model(path):
     from llama_cpp import Llama
 
-    cpu_count = os.cpu_count() or 4
-    print(f"[{WORKER_ID}] loading model with {cpu_count} threads ...", flush=True)
+    print(f"[{WORKER_ID}] loading model with {CPU_COUNT} threads ...", flush=True)
+    t0 = time.time()
     llm = Llama(
         model_path=path,
         n_ctx=4096,
-        n_threads=cpu_count,
+        n_threads=CPU_COUNT,
+        n_threads_batch=CPU_COUNT,
         verbose=False,
     )
-    print(f"[{WORKER_ID}] model loaded", flush=True)
-    return llm
+    load_seconds = time.time() - t0
+    print(f"[{WORKER_ID}] model loaded ({load_seconds:.1f}s)", flush=True)
+    return llm, load_seconds
 
 
 def _register_worker(conn):
@@ -129,6 +142,34 @@ def _register_worker(conn):
                 started_at = CURRENT_TIMESTAMP
             """,
             (WORKER_ID, MODEL_NAME),
+        )
+
+
+def _start_worker_run(conn):
+    with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO worker_runs (worker_id, model_name, model_version) "
+            "VALUES (%s, %s, %s)",
+            (WORKER_ID, MODEL_NAME, MODEL_FILE),
+        )
+        return cur.lastrowid
+
+
+def _update_worker_run_startup(conn, run_id, download_seconds, load_seconds, cache_hit):
+    with conn.cursor() as cur:
+        cur.execute(
+            "UPDATE worker_runs SET download_seconds = %s, load_seconds = %s, "
+            "startup_seconds = %s, cache_hit = %s WHERE id = %s",
+            (download_seconds, load_seconds, download_seconds + load_seconds, cache_hit, run_id),
+        )
+
+
+def _finalize_worker_run(conn, run_id, jobs_completed, jobs_failed):
+    with conn.cursor() as cur:
+        cur.execute(
+            "UPDATE worker_runs SET ended_at = NOW(), jobs_completed = %s, "
+            "jobs_failed = %s WHERE id = %s",
+            (jobs_completed, jobs_failed, run_id),
         )
 
 
@@ -178,7 +219,8 @@ def _claim_one_job(conn):
             cur.execute(
                 "UPDATE jobs SET status = 'processing', claimed_by = %s, "
                 "attempt_count = attempt_count + 1, "
-                "lease_expires_at = NOW() + INTERVAL %s SECOND "
+                "lease_expires_at = NOW() + INTERVAL %s SECOND, "
+                "claimed_at = NOW() "
                 "WHERE id = %s AND status = 'pending'",
                 (WORKER_ID, LEASE_SECONDS, job_id),
             )
@@ -219,24 +261,67 @@ def _start_lease_renewal(job_id):
     return stop_event, thread
 
 
-def _fetch_job_input(conn, job_id):
-    with conn.cursor() as cur:
-        cur.execute("SELECT input FROM jobs WHERE id = %s", (job_id,))
-        row = cur.fetchone()
-        return row["input"] if row else None
-
-
-def run_inference(llm, prompt_text):
-    messages = [{"role": "user", "content": prompt_text}]
-    out = llm.create_chat_completion(messages=messages, max_tokens=512, temperature=0.7)
-    return out["choices"][0]["message"]["content"]
-
-
-def _complete_job(conn, job_id, result_text):
+def _fetch_job_details(conn, job_id):
     with conn.cursor() as cur:
         cur.execute(
-            "UPDATE jobs SET status = 'done', result = %s WHERE id = %s",
-            (result_text, job_id),
+            "SELECT input, created_at, claimed_at, max_tokens FROM jobs WHERE id = %s",
+            (job_id,),
+        )
+        return cur.fetchone()
+
+
+def run_inference(llm, prompt_text, max_tokens):
+    """Runs one inference call and measures it. peak_rss is the whole
+    process's peak resident memory at this moment (dominated by the
+    loaded model weights) — it's not isolated to this one job, since a
+    long-lived worker process can't cleanly separate memory use between
+    requests. Treat it as a per-worker ceiling, not a per-job cost."""
+    messages = [{"role": "user", "content": prompt_text}]
+
+    wall_start = time.time()
+    cpu_start = time.process_time()
+    out = llm.create_chat_completion(messages=messages, max_tokens=max_tokens, temperature=0.7)
+    wall_elapsed = time.time() - wall_start
+    cpu_elapsed = time.process_time() - cpu_start
+
+    result_text = out["choices"][0]["message"]["content"]
+    cpu_utilization_pct = (
+        min(100.0, (cpu_elapsed / wall_elapsed / CPU_COUNT) * 100) if wall_elapsed > 0 else 0.0
+    )
+    peak_rss_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024  # KB -> MB on Linux
+
+    metrics = dict(
+        inference_seconds=round(wall_elapsed, 3),
+        cpu_seconds=round(cpu_elapsed, 3),
+        cpu_utilization_pct=round(cpu_utilization_pct, 1),
+        peak_rss_mb=round(peak_rss_mb, 1),
+        input_chars=len(prompt_text),
+        output_chars=len(result_text),
+    )
+    return result_text, metrics
+
+
+def _complete_job(conn, job_id, result_text, queue_wait_seconds, metrics):
+    with conn.cursor() as cur:
+        cur.execute(
+            "UPDATE jobs SET status = 'done', result = %s, completed_at = NOW(), "
+            "total_seconds = TIMESTAMPDIFF(SECOND, created_at, NOW()), "
+            "queue_wait_seconds = %s, inference_seconds = %s, cpu_seconds = %s, "
+            "cpu_utilization_pct = %s, peak_rss_mb = %s, input_chars = %s, "
+            "output_chars = %s, model_version = %s "
+            "WHERE id = %s",
+            (
+                result_text,
+                queue_wait_seconds,
+                metrics["inference_seconds"],
+                metrics["cpu_seconds"],
+                metrics["cpu_utilization_pct"],
+                metrics["peak_rss_mb"],
+                metrics["input_chars"],
+                metrics["output_chars"],
+                MODEL_FILE,
+                job_id,
+            ),
         )
 
 
@@ -270,17 +355,21 @@ def _bump_counter(conn, column):
 def main():
     start_time = time.time()
     _run(_register_worker)
+    run_id = _run(_start_worker_run)
 
     # No DB connection is held open across this step on purpose — it can
     # take a long time, and a connection left idle that long gets dropped.
-    model_path = download_model()
-    llm = load_model(model_path)
+    model_path, download_seconds, cache_hit = download_model()
+    llm, load_seconds = load_model(model_path)
+    _run(_update_worker_run_startup, run_id, download_seconds, load_seconds, cache_hit)
 
     _run(_set_worker_status, "ready", None)
     print(f"[{WORKER_ID}] worker ready, entering poll loop", flush=True)
 
     poll_interval = 2
     max_poll_interval = 30
+    local_completed = 0
+    local_failed = 0
 
     try:
         while not _stop_requested:
@@ -304,21 +393,39 @@ def main():
 
             stop_renewal, renewal_thread = _start_lease_renewal(job_id)
             try:
-                prompt_text = _run(_fetch_job_input, job_id)
-                result_text = run_inference(llm, prompt_text)
-                _run(_complete_job, job_id, result_text)
-                print(f"[{WORKER_ID}] completed job {job_id}", flush=True)
+                details = _run(_fetch_job_details, job_id)
+                queue_wait_seconds = None
+                if details["claimed_at"] and details["created_at"]:
+                    queue_wait_seconds = round(
+                        (details["claimed_at"] - details["created_at"]).total_seconds(), 3
+                    )
+                max_tokens = details["max_tokens"] or DEFAULT_MAX_TOKENS
+
+                result_text, metrics = run_inference(llm, details["input"], max_tokens)
+                _run(_complete_job, job_id, result_text, queue_wait_seconds, metrics)
+                print(
+                    f"[{WORKER_ID}] completed job {job_id} "
+                    f"(queue_wait={queue_wait_seconds}s, inference={metrics['inference_seconds']}s, "
+                    f"cpu_util={metrics['cpu_utilization_pct']}%)",
+                    flush=True,
+                )
                 _run(_bump_counter, "jobs_completed")
+                local_completed += 1
             except Exception as exc:  # noqa: BLE001
                 print(f"[{WORKER_ID}] job {job_id} failed: {exc}", flush=True)
                 traceback.print_exc()
                 _run(_fail_job, job_id, str(exc)[:500])
                 _run(_bump_counter, "jobs_failed")
+                local_failed += 1
             finally:
                 stop_renewal.set()
                 renewal_thread.join(timeout=5)
                 _run(_set_worker_status, "ready", None)
     finally:
+        try:
+            _run(_finalize_worker_run, run_id, local_completed, local_failed)
+        except Exception:  # noqa: BLE001
+            pass
         try:
             _run(_set_worker_status, "offline", None)
         except Exception:  # noqa: BLE001
