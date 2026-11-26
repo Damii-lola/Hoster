@@ -366,8 +366,8 @@ def main():
     _run(_set_worker_status, "ready", None)
     print(f"[{WORKER_ID}] worker ready, entering poll loop", flush=True)
 
-    poll_interval = 2
-    max_poll_interval = 30
+    poll_interval = 1
+    max_poll_interval = 8  # was 30 — Phase 2A metrics showed jobs landing mid-sleep cost 20s+ of pure queue wait
     local_completed = 0
     local_failed = 0
 
@@ -384,10 +384,10 @@ def main():
             job_id = _run(_claim_one_job)
             if job_id is None:
                 time.sleep(poll_interval)
-                poll_interval = min(poll_interval * 2, max_poll_interval)
+                poll_interval = min(poll_interval * 1.5, max_poll_interval)
                 continue
 
-            poll_interval = 2  # reset backoff — we found work
+            poll_interval = 1  # reset backoff — we found work
             _run(_set_worker_status, "busy", job_id)
             print(f"[{WORKER_ID}] claimed job {job_id}", flush=True)
 
