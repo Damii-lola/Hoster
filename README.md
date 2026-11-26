@@ -43,12 +43,21 @@ You should see `status` move from `pending` → `processing` → `done`, with th
 
 ## 5. The crash-recovery test
 
-This is the step that actually proves the architecture, not just the happy path:
+This is the step that actually proves the architecture, not just the happy path.
+
+A job's lease is only renewed while a worker is genuinely still processing it (a background thread renews it every `LEASE_RENEWAL_INTERVAL_SECONDS`, default 30s). If the worker dies, renewals stop, and the lease (`LEASE_SECONDS`, default 90s) expires on its own — a real crash is detected in well under two minutes, while a job that's just taking a while to run is never wrongly reclaimed, no matter how long it takes.
+
+Important: recovery still only happens when **some worker is actively polling** — a stale lease doesn't fix itself in the background with nothing running. The next worker run's `reclaim_stale_jobs()` check is what actually flips it back to `pending`.
+
+To test it:
 
 1. Submit a job as above.
 2. As soon as the Actions log shows `claimed job <id>`, go to the Actions tab and **cancel the running workflow** mid-job.
-3. Re-run the workflow (or wait for a new one).
-4. Check `GET /result/<job_id>` again — because of `reclaim_stale_jobs()`, the job should go back to `pending` after its lease (10 minutes by default) expires, and the next worker run should pick it up and complete it, rather than it being lost forever.
+3. Wait about 90 seconds to 2 minutes (not 10 minutes — see above).
+4. **Trigger the workflow again** (a new run has to actually start and run its poll loop for the reclaim check to fire).
+5. Check `GET /result/<job_id>` — it should have gone back to `pending` and then been picked up and completed by the new run, rather than being lost forever.
+
+If you want to stress-test the lease timing itself, temporarily lower `LEASE_SECONDS` and `LEASE_RENEWAL_INTERVAL_SECONDS` even further via the workflow's `env:` block (e.g. `LEASE_SECONDS: "30"`, `LEASE_RENEWAL_INTERVAL_SECONDS: "10"`), then set them back once you're done.
 
 If that works, the core loop is proven and we move on to:
 - cloning this into 4 more repos with staggered schedules,

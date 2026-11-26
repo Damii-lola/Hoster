@@ -32,6 +32,7 @@ import sys
 import time
 import uuid
 import signal
+import threading
 import traceback
 
 os.environ.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "1")  # much faster model download
@@ -45,7 +46,17 @@ MODEL_NAME = os.environ.get("MODEL_NAME", "Qwen/Qwen2.5-7B-Instruct")
 
 WORKER_ID = os.environ.get("WORKER_ID", f"gha-{uuid.uuid4().hex[:8]}")
 MAX_RUNTIME_SECONDS = int(os.environ.get("MAX_RUNTIME_SECONDS", 17700))
-LEASE_SECONDS = int(os.environ.get("LEASE_SECONDS", 600))
+
+# How long a claimed job is considered "alive" without a renewal before
+# another worker may reclaim it. Short on purpose: as long as this worker
+# is actually still processing, it renews the lease well before this
+# expires (see LEASE_RENEWAL_INTERVAL_SECONDS below), so a genuinely slow
+# job is never wrongly reclaimed. If the worker dies, renewals stop and
+# the job becomes reclaimable after this many seconds — not after some
+# long fixed timeout regardless of what actually happened.
+LEASE_SECONDS = int(os.environ.get("LEASE_SECONDS", 90))
+LEASE_RENEWAL_INTERVAL_SECONDS = int(os.environ.get("LEASE_RENEWAL_INTERVAL_SECONDS", 30))
+
 SHUTDOWN_MARGIN_SECONDS = 300  # stop claiming new jobs this long before the hard cutoff
 
 _stop_requested = False
@@ -176,6 +187,38 @@ def _claim_one_job(conn):
     return None
 
 
+def _renew_lease(conn, job_id):
+    """Push the job's deadline forward. Only takes effect while the job
+    is still 'processing' under this worker — if it already finished,
+    failed, or got reclaimed by someone else, this is a harmless no-op."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "UPDATE jobs SET lease_expires_at = NOW() + INTERVAL %s SECOND "
+            "WHERE id = %s AND status = 'processing' AND claimed_by = %s",
+            (LEASE_SECONDS, job_id, WORKER_ID),
+        )
+
+
+def _start_lease_renewal(job_id):
+    """Runs in a background thread for as long as this job is being
+    processed, renewing its lease periodically. If the main thread dies
+    (crash, kill, cancelled workflow), this thread dies with it and
+    renewals simply stop — which is exactly what lets another worker
+    detect the failure and reclaim the job quickly."""
+    stop_event = threading.Event()
+
+    def _loop():
+        while not stop_event.wait(LEASE_RENEWAL_INTERVAL_SECONDS):
+            try:
+                _run(_renew_lease, job_id, retries=1)
+            except Exception as exc:  # noqa: BLE001
+                print(f"[{WORKER_ID}] lease renewal failed: {exc}", flush=True)
+
+    thread = threading.Thread(target=_loop, daemon=True)
+    thread.start()
+    return stop_event, thread
+
+
 def _fetch_job_input(conn, job_id):
     with conn.cursor() as cur:
         cur.execute("SELECT input FROM jobs WHERE id = %s", (job_id,))
@@ -259,6 +302,7 @@ def main():
             _run(_set_worker_status, "busy", job_id)
             print(f"[{WORKER_ID}] claimed job {job_id}", flush=True)
 
+            stop_renewal, renewal_thread = _start_lease_renewal(job_id)
             try:
                 prompt_text = _run(_fetch_job_input, job_id)
                 result_text = run_inference(llm, prompt_text)
@@ -271,6 +315,8 @@ def main():
                 _run(_fail_job, job_id, str(exc)[:500])
                 _run(_bump_counter, "jobs_failed")
             finally:
+                stop_renewal.set()
+                renewal_thread.join(timeout=5)
                 _run(_set_worker_status, "ready", None)
     finally:
         try:
