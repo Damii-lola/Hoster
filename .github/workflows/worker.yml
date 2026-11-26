@@ -12,7 +12,7 @@ permissions:
 jobs:
   worker:
     runs-on: ubuntu-latest
-    timeout-minutes: 300
+    timeout-minutes: 300   # 5 hours — safely under GitHub's 6-hour hard limit
     steps:
       - uses: actions/checkout@v4
 
@@ -37,8 +37,8 @@ jobs:
         run: python worker/worker.py
 
       - name: Schedule next run in 2 minutes
-        if: always()
-        continue-on-error: true
+        if: always()           # runs even if the worker step above crashed, so the chain never just dies
+        continue-on-error: true  # a scheduling failure shouldn't paint this whole run red
         run: |
           echo "Waiting 2 minutes before triggering the next run..."
           sleep 120

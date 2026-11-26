@@ -1,0 +1,64 @@
+name: Hoster Multi-Worker Test (Phase 2B)
+
+# Manually-triggered only. This spins up 3 real workers at the same
+# time, each on its own GitHub-hosted runner, all hitting the same
+# TiDB jobs/workers tables concurrently. Worker A and B share a model
+# (so they genuinely compete for the same jobs — this is what proves
+# no-double-claim and fair distribution), Worker C runs a different,
+# smaller model (this proves multi-model routing: C should only ever
+# claim jobs whose model_name matches its own).
+#
+# This is a short test run (not the production worker), so it uses a
+# much smaller MAX_RUNTIME_SECONDS and a shorter job timeout.
+
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  worker:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    strategy:
+      fail-fast: false   # one worker failing/being cancelled must NOT cancel the others — that's the point of this test
+      matrix:
+        include:
+          - worker_id: gha-worker-a
+            model_repo: bartowski/Qwen2.5-7B-Instruct-GGUF
+            model_file: Qwen2.5-7B-Instruct-Q4_K_M.gguf
+            model_name: Qwen/Qwen2.5-7B-Instruct
+          - worker_id: gha-worker-b
+            model_repo: bartowski/Qwen2.5-7B-Instruct-GGUF
+            model_file: Qwen2.5-7B-Instruct-Q4_K_M.gguf
+            model_name: Qwen/Qwen2.5-7B-Instruct
+          - worker_id: gha-worker-c
+            model_repo: bartowski/Qwen2.5-3B-Instruct-GGUF
+            model_file: Qwen2.5-3B-Instruct-Q4_K_M.gguf
+            model_name: Qwen/Qwen2.5-3B-Instruct
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r worker/requirements.txt
+
+      - name: Cache Hugging Face model
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/huggingface
+          key: hf-cache-${{ matrix.model_file }}-v1
+
+      - name: Run worker (${{ matrix.worker_id }})
+        env:
+          TIDB_CONNECTION_STRING: ${{ secrets.TIDB_CONNECTION_STRING }}
+          WORKER_ID: ${{ matrix.worker_id }}
+          MODEL_REPO: ${{ matrix.model_repo }}
+          MODEL_FILE: ${{ matrix.model_file }}
+          MODEL_NAME: ${{ matrix.model_name }}
+          MAX_RUNTIME_SECONDS: "1500"   # ~25 min test window, not a full production run
+        run: python worker/worker.py

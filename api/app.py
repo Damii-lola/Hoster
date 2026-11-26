@@ -168,6 +168,62 @@ def metrics():
     )
 
 
+@app.get("/jobs")
+def recent_jobs():
+    """Phase 2B observability: see which worker claimed which job, live.
+    GET /jobs?limit=20 (default 20, max 100)."""
+    try:
+        limit = min(int(request.args.get("limit", 20)), 100)
+    except ValueError:
+        limit = 20
+
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT id, model_name, status, claimed_by, attempt_count, "
+                "created_at, claimed_at, completed_at "
+                "FROM jobs ORDER BY created_at DESC LIMIT %s",
+                (limit,),
+            )
+            rows = cur.fetchall()
+    finally:
+        conn.close()
+
+    for row in rows:
+        for k in ("created_at", "claimed_at", "completed_at"):
+            if row[k] is not None:
+                row[k] = str(row[k])
+
+    return jsonify(jobs=rows)
+
+
+@app.get("/workers")
+def list_workers():
+    """Phase 2B observability: see every worker that's registered
+    itself, its current status, and its lifetime counters — watch
+    several run independently, and see one go offline without the
+    others being affected."""
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT worker_id, available_models, status, current_job_id, "
+                "jobs_completed, jobs_failed, started_at, last_heartbeat "
+                "FROM workers ORDER BY last_heartbeat DESC"
+            )
+            rows = cur.fetchall()
+    finally:
+        conn.close()
+
+    for row in rows:
+        for k in ("started_at", "last_heartbeat"):
+            if row[k] is not None:
+                row[k] = str(row[k])
+
+    return jsonify(workers=rows)
+
+
 @app.get("/health")
 def health():
     conn = get_connection()
