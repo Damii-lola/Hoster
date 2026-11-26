@@ -3,7 +3,11 @@ name: Hoster Worker
 on:
   workflow_dispatch: {}
   schedule:
-    - cron: "0 0 * * *"
+    - cron: "0 0 * * *"   # safety net only now — see "Schedule next run" step below for the real coverage
+
+permissions:
+  actions: write   # required so this run can trigger the next one
+  contents: read
 
 jobs:
   worker:
@@ -31,3 +35,15 @@ jobs:
           WORKER_ID: "gha-worker-1"
           MAX_RUNTIME_SECONDS: "17700"
         run: python worker/worker.py
+
+      - name: Schedule next run in 2 minutes
+        if: always()
+        continue-on-error: true
+        run: |
+          echo "Waiting 2 minutes before triggering the next run..."
+          sleep 120
+          curl -s -X POST \
+            -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ github.repository }}/actions/workflows/worker.yml/dispatches" \
+            -d '{"ref":"${{ github.ref_name }}"}'
