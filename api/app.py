@@ -107,10 +107,22 @@ def get_result(job_id):
 
 @app.get("/metrics")
 def metrics():
-    """Aggregate benchmark numbers across every completed job and every
-    worker boot so far, grouped by exact model file. This is the data
-    Phase 2A exists to collect — use it to decide what to optimize
-    instead of guessing."""
+    """Aggregate benchmark numbers, grouped by exact model file. This is
+    the data Phase 2A exists to collect — use it to decide what to
+    optimize instead of guessing.
+
+    By default this covers every completed job ever, which means it
+    mixes data from before and after any code change you make — a
+    genuine improvement can be invisible in the lifetime average for a
+    while, diluted by older/slower jobs. Pass ?since_minutes=30 to see
+    only jobs/worker boots from the last 30 minutes, e.g. right after
+    deploying a change you're trying to verify.
+    """
+    since_minutes = request.args.get("since_minutes", type=int)
+    job_time_filter = "AND completed_at >= NOW() - INTERVAL %s MINUTE" if since_minutes else ""
+    worker_time_filter = "AND started_at >= NOW() - INTERVAL %s MINUTE" if since_minutes else ""
+    params = (since_minutes,) if since_minutes else ()
+
     conn = get_connection()
     try:
         with conn.cursor() as cur:
@@ -124,7 +136,8 @@ def metrics():
                 "AVG(input_chars) AS avg_input_chars, "
                 "AVG(output_chars) AS avg_output_chars, "
                 "AVG(max_tokens) AS avg_max_tokens "
-                "FROM jobs WHERE status = 'done' GROUP BY model_version"
+                f"FROM jobs WHERE status = 'done' {job_time_filter} GROUP BY model_version",
+                params,
             )
             job_stats = cur.fetchall()
 
@@ -134,8 +147,9 @@ def metrics():
                 "AVG(load_seconds) AS avg_load_seconds, "
                 "AVG(startup_seconds) AS avg_startup_seconds, "
                 "SUM(cache_hit) / COUNT(*) * 100 AS cache_hit_rate_pct "
-                "FROM worker_runs WHERE startup_seconds IS NOT NULL "
-                "GROUP BY model_version"
+                f"FROM worker_runs WHERE startup_seconds IS NOT NULL {worker_time_filter} "
+                "GROUP BY model_version",
+                params,
             )
             worker_stats = cur.fetchall()
     finally:

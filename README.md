@@ -64,6 +64,16 @@ If that works, the core loop is proven and we move on to:
 - quantizing/benchmarking the model properly,
 - and the monitoring/security layers we discussed.
 
+## Self-rescheduling worker (no more manually re-triggering it)
+
+The workflow now ends with a step that waits 2 minutes, then tells GitHub to start a brand new run of itself — which does the same thing when it finishes, and so on. This replaces "a human has to remember to click Run workflow" with a continuous chain, with only a ~2 minute gap between one run ending and the next one being ready.
+
+**One-time setup required:** go to this repo's **Settings → Actions → General → Workflow permissions**, and make sure **"Read and write permissions"** is selected. Without this, the default `GITHUB_TOKEN` can't trigger the next run, and the chain will silently stop after one cycle (the step is set to not fail the run, so you won't see an error — just no next run appearing).
+
+What this fixes directly: a large chunk of the `queue_wait_seconds` blowup you saw was from jobs sitting in `pending` with zero workers active at all, because nothing restarted the worker between manual tests. That's a different (and bigger) problem than the polling-backoff tuning from before — this fixes the "no worker alive" case; the backoff fix still matters for the few seconds *within* an active run.
+
+**Worth knowing, not a warning to stop:** a self-perpetuating chain that keeps a repo's Actions running close to continuously is exactly the kind of usage pattern GitHub's fair-use policy for free public-repo runners is watching for — this was flagged as a risk all the way back when this architecture was first proposed, and it's still true now that it's actually implemented this way. It's very likely fine for the testing and small-scale use you're doing right now; it's the kind of thing to keep in mind if this ever needs to run 24/7 indefinitely at real scale. The daily `cron` entry stays in the workflow as a dumb fallback — if the self-chain ever breaks (a runner dies outright before reaching the final step, with no retry), you're not stuck waiting more than a day without noticing.
+
 ## Phase 2A — performance intelligence
 
 Run `schema_phase2_metrics.sql` once (after `schema.sql`) to add the metrics columns and the `worker_runs` table.
@@ -72,6 +82,7 @@ Every completed job now records: queue wait time, inference time, total time, CP
 
 - **Per-job detail:** `GET /result/<job_id>` now returns a `metrics` object alongside the result.
 - **Aggregate benchmarks:** `GET /metrics` returns averages across every completed job and every worker boot, grouped by exact model file — this is the actual benchmark table from the original plan, built automatically instead of by hand.
+- **Recent-only benchmarks:** `GET /metrics?since_minutes=30` restricts those averages to jobs/worker boots from the last N minutes. Use this whenever you deploy a change and want to check its actual effect — the all-time average mixes data from before and after the change, so a real improvement can stay hidden in it for a while, diluted by older/slower jobs. The per-job `metrics` object on `GET /result/<job_id>` is also always a clean, single-job data point if you just want to eyeball one result without any averaging at all.
 
 One honest caveat: `peak_rss_mb` is the whole worker *process's* peak memory at that moment, not memory isolated to one job — a single long-lived process loading one model can't cleanly separate "this job's RAM" from "the model's RAM," so treat it as a per-worker ceiling (dominated by the model weights) rather than a per-request cost.
 
