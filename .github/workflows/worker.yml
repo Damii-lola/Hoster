@@ -19,6 +19,12 @@ jobs:
       - name: Install dependencies
         run: pip install -r worker/requirements.txt
 
+      - name: Cache Hugging Face model
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/huggingface
+          key: hf-cache-qwen2.5-7b-instruct-q4km-v1
+
       - name: Run worker
         env:
           TIDB_CONNECTION_STRING: ${{ secrets.TIDB_CONNECTION_STRING }}
