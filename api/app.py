@@ -224,6 +224,43 @@ def list_workers():
     return jsonify(workers=rows)
 
 
+@app.get("/orchestrator/log")
+def orchestrator_log():
+    """Phase 2C observability: every scale up/down/no-change decision
+    the orchestrator has made, with the real numbers behind it (pending
+    jobs, committed workers, desired workers) — so 'why did it do that'
+    always has a real answer. GET /orchestrator/log?limit=20&model=..."""
+    try:
+        limit = min(int(request.args.get("limit", 20)), 100)
+    except ValueError:
+        limit = 20
+    model_name = request.args.get("model")
+
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            if model_name:
+                cur.execute(
+                    "SELECT * FROM orchestrator_log WHERE model_name = %s "
+                    "ORDER BY run_at DESC LIMIT %s",
+                    (model_name, limit),
+                )
+            else:
+                cur.execute(
+                    "SELECT * FROM orchestrator_log ORDER BY run_at DESC LIMIT %s",
+                    (limit,),
+                )
+            rows = cur.fetchall()
+    finally:
+        conn.close()
+
+    for row in rows:
+        if row.get("run_at") is not None:
+            row["run_at"] = str(row["run_at"])
+
+    return jsonify(decisions=rows)
+
+
 @app.get("/health")
 def health():
     conn = get_connection()

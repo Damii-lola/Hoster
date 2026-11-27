@@ -147,19 +147,24 @@ def load_model(path):
 
 
 def _register_worker(conn):
+    # GITHUB_RUN_ID is a built-in Actions variable identifying this
+    # specific run. Phase 2C's orchestrator stores it so it can later
+    # cancel this exact worker's run without touching any other.
+    github_run_id = os.environ.get("GITHUB_RUN_ID")
     with conn.cursor() as cur:
         cur.execute(
             """
-            INSERT INTO workers (worker_id, available_models, status)
-            VALUES (%s, %s, 'starting')
+            INSERT INTO workers (worker_id, available_models, status, github_run_id)
+            VALUES (%s, %s, 'starting', %s)
             ON DUPLICATE KEY UPDATE
                 available_models = VALUES(available_models),
                 status = 'starting',
                 jobs_completed = 0,
                 jobs_failed = 0,
-                started_at = CURRENT_TIMESTAMP
+                started_at = CURRENT_TIMESTAMP,
+                github_run_id = VALUES(github_run_id)
             """,
-            (WORKER_ID, MODEL_NAME),
+            (WORKER_ID, MODEL_NAME, github_run_id),
         )
 
 

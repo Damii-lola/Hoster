@@ -64,6 +64,26 @@ If that works, the core loop is proven and we move on to:
 - quantizing/benchmarking the model properly,
 - and the monitoring/security layers we discussed.
 
+## Phase 2C — worker orchestration
+
+Run `schema_phase2c_orchestrator.sql` once (after the Phase 2A migration), then add `orchestrated-worker.yml` and `orchestrator.yml` are already set up to run on their own — no new secrets needed, since the orchestrator reuses the same built-in `secrets.GITHUB_TOKEN` mechanism already proven by the self-rescheduling worker, with `permissions: actions: write` granting it the right to dispatch new runs and cancel specific ones.
+
+**What it actually does, every 10 minutes:** for every model with pending jobs or currently-alive auto-scaled workers, it computes `pending_jobs`, `committed_workers` (auto-workers that are `starting`, `ready`, or `busy`, with a heartbeat fresh within `WORKER_STALE_SECONDS`), and a `desired_workers` count (`ceil(pending_jobs / JOBS_PER_WORKER_TARGET)`, capped at `MAX_WORKERS_PER_MODEL`, defaulting to 3 and 3). If committed is below desired, it launches the shortfall as new independent `orchestrated-worker.yml` runs. If committed exceeds desired (including dropping to zero once a backlog clears), it cancels the excess — preferring idle workers first, falling back to busy ones only if it must, which is safe because the existing lease/reclaim system (Phase 1/2B) already guarantees an interrupted job survives regardless of why a worker died.
+
+**Direct answers to the original Phase 2C questions:**
+- *Which workers should start, for which models?* — `MODEL_REGISTRY` in `orchestrator.py` maps each model name to its download info; any model with pending jobs gets evaluated, any model not in the registry is skipped with a logged note (the one manual step: add an entry when you introduce a new model).
+- *When should they start/stop?* — every cycle, whenever committed capacity doesn't match computed demand.
+- *How many are needed? Is the queue growing?* — `GET /orchestrator/log` shows `pending_jobs` and `desired_workers` over time per model, so growth is just comparing rows, not a guess.
+- *Is a worker actually ready?* — only `status IN ('ready','busy')` with a live heartbeat counts as real capacity; a worker still downloading its model (`starting`) counts as committed-but-not-yet-serving, so the orchestrator won't double-launch for it, but also won't count it as already handling load.
+- *Which worker receives the next job?* — deliberately **not** decided here. Jobs are claimed by the atomic SQL `UPDATE ... WHERE status='pending'` already in `worker.py`, proven race-free and reasonably fair under real concurrency in Phase 2B. Building a central assignment step here would duplicate that guarantee while adding a new way for it to break — so this orchestrator only ever decides *how many* workers exist per model, never which specific job goes to which specific worker.
+
+**Safety boundary:** the orchestrator only ever touches workers whose `worker_id` starts with `gha-auto-`. Your standing baseline (`gha-worker-1`) and any manual test workers are never launched, never cancelled, and never counted toward `committed_workers` by this system — on purpose, so an experiment here can't take down the one worker you know works.
+
+**Honest limitations, not hidden:**
+- The scale-up/down math is a simple, tunable linear formula — not a learned or adaptive model. It's meant to be a correct, inspectable starting point, not a final answer; `JOBS_PER_WORKER_TARGET` and `MAX_WORKERS_PER_MODEL` are both environment variables on `orchestrator.yml` specifically so you can tune them once you have a feel for real traffic.
+- A 10-minute cycle means it can take up to 10 minutes to notice a sudden backlog spike, and up to 10 minutes to notice a backlog has cleared. This is a deliberate cost/responsiveness trade-off for a free scheduled workflow, not an oversight — lower the cron interval if you need tighter reaction time, at the cost of more orchestrator runs.
+- `MODEL_REGISTRY` is manual, static config — the system does not auto-discover a new model's download details from just seeing a new `model_name` show up in a job. That would mean blindly trusting arbitrary caller-supplied strings as things to download and execute, which is a real risk, not a convenience worth adding casually.
+
 ## Self-rescheduling worker (no more manually re-triggering it)
 
 The workflow now ends with a step that waits 2 minutes, then tells GitHub to start a brand new run of itself — which does the same thing when it finishes, and so on. This replaces "a human has to remember to click Run workflow" with a continuous chain, with only a ~2 minute gap between one run ending and the next one being ready.
