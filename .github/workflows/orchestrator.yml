@@ -1,0 +1,30 @@
+name: Hoster Orchestrator
+
+on:
+  workflow_dispatch: {}
+  schedule:
+    - cron: "*/10 * * * *"   # every 10 minutes
+
+permissions:
+  actions: write   # to dispatch new orchestrated-worker runs and cancel specific ones
+  contents: read
+
+jobs:
+  orchestrate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5   # this is just decision-making + a few API calls, not model inference
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r orchestrator/requirements.txt
+
+      - name: Run orchestrator
+        env:
+          TIDB_CONNECTION_STRING: ${{ secrets.TIDB_CONNECTION_STRING }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python orchestrator/orchestrator.py
