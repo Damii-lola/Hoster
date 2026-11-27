@@ -58,6 +58,17 @@ MAX_RUNTIME_SECONDS = int(os.environ.get("MAX_RUNTIME_SECONDS", 17700))
 LEASE_SECONDS = int(os.environ.get("LEASE_SECONDS", 90))
 LEASE_RENEWAL_INTERVAL_SECONDS = int(os.environ.get("LEASE_RENEWAL_INTERVAL_SECONDS", 30))
 
+# Same idea as the job lease above, but for the worker's own row in
+# `workers`: a persistent background thread (started once, for the
+# worker's whole lifetime) heartbeats every WORKER_HEARTBEAT_INTERVAL_SECONDS
+# regardless of idle/busy state. Any worker whose heartbeat goes silent
+# for WORKER_STALE_SECONDS gets marked offline by whichever worker next
+# runs the stale-check — cleaning up rows left behind by a real crash
+# (which skips normal shutdown) without ever misclassifying a worker
+# that's just busy on a long job.
+WORKER_HEARTBEAT_INTERVAL_SECONDS = int(os.environ.get("WORKER_HEARTBEAT_INTERVAL_SECONDS", 20))
+WORKER_STALE_SECONDS = int(os.environ.get("WORKER_STALE_SECONDS", 90))
+
 # Test-only hook (Phase 2B): if set, this worker hard-kills its own
 # process this many seconds after becoming ready — simulating a real
 # crash from inside the process, rather than relying on GitHub's
@@ -194,6 +205,40 @@ def _heartbeat(conn):
         cur.execute(
             "UPDATE workers SET last_heartbeat = CURRENT_TIMESTAMP WHERE worker_id = %s",
             (WORKER_ID,),
+        )
+
+
+def _start_worker_heartbeat():
+    """Runs for this worker's entire lifetime, independent of whether
+    it's idle or busy on a job. Without this, last_heartbeat only moves
+    between jobs — so a worker genuinely busy on one long task looks
+    exactly like a worker that silently died. This thread is what makes
+    'no heartbeat in WORKER_STALE_SECONDS' a reliable crash signal
+    instead of a false alarm on slow (but healthy) work."""
+    stop_event = threading.Event()
+
+    def _loop():
+        while not stop_event.wait(WORKER_HEARTBEAT_INTERVAL_SECONDS):
+            try:
+                _run(_heartbeat, retries=1)
+            except Exception as exc:  # noqa: BLE001
+                print(f"[{WORKER_ID}] worker heartbeat failed: {exc}", flush=True)
+
+    thread = threading.Thread(target=_loop, daemon=True)
+    thread.start()
+    return stop_event, thread
+
+
+def _mark_stale_workers_offline(conn):
+    """Any worker (this one or another) whose heartbeat has gone silent
+    for WORKER_STALE_SECONDS is marked offline. Safe to call from any
+    worker — it's just a conditional UPDATE, and whichever worker
+    happens to run it first wins; no coordination needed."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "UPDATE workers SET status = 'offline' "
+            "WHERE status != 'offline' AND last_heartbeat < NOW() - INTERVAL %s SECOND",
+            (WORKER_STALE_SECONDS,),
         )
 
 
@@ -373,6 +418,8 @@ def main():
     _run(_set_worker_status, "ready", None)
     print(f"[{WORKER_ID}] worker ready, entering poll loop", flush=True)
 
+    stop_worker_heartbeat, worker_heartbeat_thread = _start_worker_heartbeat()
+
     if SIMULATE_CRASH_AFTER_SECONDS:
         delay = float(SIMULATE_CRASH_AFTER_SECONDS)
 
@@ -397,8 +444,8 @@ def main():
                 print(f"[{WORKER_ID}] approaching time budget, shutting down", flush=True)
                 break
 
-            _run(_heartbeat)
             _run(_reclaim_stale_jobs)
+            _run(_mark_stale_workers_offline)
 
             job_id = _run(_claim_one_job)
             if job_id is None:
@@ -441,6 +488,8 @@ def main():
                 renewal_thread.join(timeout=5)
                 _run(_set_worker_status, "ready", None)
     finally:
+        stop_worker_heartbeat.set()
+        worker_heartbeat_thread.join(timeout=5)
         try:
             _run(_finalize_worker_run, run_id, local_completed, local_failed)
         except Exception:  # noqa: BLE001
