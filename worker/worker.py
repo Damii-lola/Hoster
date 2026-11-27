@@ -58,6 +58,13 @@ MAX_RUNTIME_SECONDS = int(os.environ.get("MAX_RUNTIME_SECONDS", 17700))
 LEASE_SECONDS = int(os.environ.get("LEASE_SECONDS", 90))
 LEASE_RENEWAL_INTERVAL_SECONDS = int(os.environ.get("LEASE_RENEWAL_INTERVAL_SECONDS", 30))
 
+# Test-only hook (Phase 2B): if set, this worker hard-kills its own
+# process this many seconds after becoming ready — simulating a real
+# crash from inside the process, rather than relying on GitHub's
+# cancel-workflow button, which cancels an entire matrix run at once
+# and can't target one job independently. Unset in production.
+SIMULATE_CRASH_AFTER_SECONDS = os.environ.get("SIMULATE_CRASH_AFTER_SECONDS", "").strip()
+
 SHUTDOWN_MARGIN_SECONDS = 300  # stop claiming new jobs this long before the hard cutoff
 CPU_COUNT = os.cpu_count() or 4
 
@@ -365,6 +372,18 @@ def main():
 
     _run(_set_worker_status, "ready", None)
     print(f"[{WORKER_ID}] worker ready, entering poll loop", flush=True)
+
+    if SIMULATE_CRASH_AFTER_SECONDS:
+        delay = float(SIMULATE_CRASH_AFTER_SECONDS)
+
+        def _simulate_crash():
+            time.sleep(delay)
+            print(f"[{WORKER_ID}] SIMULATED CRASH NOW (test hook) — hard-killing process, "
+                  f"no cleanup, no graceful shutdown", flush=True)
+            os._exit(137)  # bypasses all finally/except blocks — a real crash, not an exit
+
+        threading.Thread(target=_simulate_crash, daemon=True).start()
+        print(f"[{WORKER_ID}] test hook armed: will simulate a crash in {delay}s", flush=True)
 
     poll_interval = 1
     max_poll_interval = 8  # was 30 — Phase 2A metrics showed jobs landing mid-sleep cost 20s+ of pure queue wait

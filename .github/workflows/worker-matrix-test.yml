@@ -29,14 +29,17 @@ jobs:
             model_repo: bartowski/Qwen2.5-7B-Instruct-GGUF
             model_file: Qwen2.5-7B-Instruct-Q4_K_M.gguf
             model_name: Qwen/Qwen2.5-7B-Instruct
+            simulate_crash_after: ""
           - worker_id: gha-worker-b
             model_repo: bartowski/Qwen2.5-7B-Instruct-GGUF
             model_file: Qwen2.5-7B-Instruct-Q4_K_M.gguf
             model_name: Qwen/Qwen2.5-7B-Instruct
+            simulate_crash_after: "60"   # this one hard-crashes itself 60s after becoming ready — the Phase 2B failure test
           - worker_id: gha-worker-c
             model_repo: bartowski/Qwen2.5-3B-Instruct-GGUF
             model_file: Qwen2.5-3B-Instruct-Q4_K_M.gguf
             model_name: Qwen/Qwen2.5-3B-Instruct
+            simulate_crash_after: ""
     steps:
       - uses: actions/checkout@v4
 
@@ -61,4 +64,5 @@ jobs:
           MODEL_FILE: ${{ matrix.model_file }}
           MODEL_NAME: ${{ matrix.model_name }}
           MAX_RUNTIME_SECONDS: "1500"   # ~25 min test window, not a full production run
+          SIMULATE_CRASH_AFTER_SECONDS: ${{ matrix.simulate_crash_after }}
         run: python worker/worker.py
