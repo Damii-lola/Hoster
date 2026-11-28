@@ -36,14 +36,22 @@ jobs:
           MAX_RUNTIME_SECONDS: "17700"
         run: python worker/worker.py
 
-      - name: Schedule next run in 2 minutes
+      - name: Schedule next run in 2 minutes (unless paused)
         if: always()           # runs even if the worker step above crashed, so the chain never just dies
         continue-on-error: true  # a scheduling failure shouldn't paint this whole run red
+        env:
+          API_BASE_URL: ${{ secrets.API_BASE_URL }}   # optional; falls back to the known URL below if unset
         run: |
           echo "Waiting 2 minutes before triggering the next run..."
           sleep 120
-          curl -s -X POST \
-            -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
-            -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/${{ github.repository }}/actions/workflows/worker.yml/dispatches" \
-            -d '{"ref":"${{ github.ref_name }}"}'
+          BASE_URL="${API_BASE_URL:-https://hoster-iwfv.onrender.com}"
+          PAUSED=$(curl -s "${BASE_URL}/control/status" | python3 -c "import json,sys; print(json.load(sys.stdin).get('paused', False))" 2>/dev/null || echo "False")
+          if [ "$PAUSED" = "True" ]; then
+            echo "Kill switch is engaged — not scheduling a next run."
+          else
+            curl -s -X POST \
+              -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${{ github.repository }}/actions/workflows/worker.yml/dispatches" \
+              -d '{"ref":"${{ github.ref_name }}"}'
+          fi
