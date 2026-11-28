@@ -64,6 +64,20 @@ If that works, the core loop is proven and we move on to:
 - quantizing/benchmarking the model properly,
 - and the monitoring/security layers we discussed.
 
+## Kill switch
+
+Run `schema_phase2d_kill_switch.sql` once (any time after `schema.sql`). This adds a single-row `system_control` table with one `paused` flag, and three endpoints:
+
+```bash
+curl -X POST https://hoster-iwfv.onrender.com/control/pause -H "Content-Type: application/json" -d '{"reason": "optional note to yourself"}'
+curl -X POST https://hoster-iwfv.onrender.com/control/resume
+curl https://hoster-iwfv.onrender.com/control/status
+```
+
+**What pausing actually does, precisely:** every worker checks the flag once per poll-loop iteration, right before it would claim a new job. If paused, it logs why, stops claiming new work, and exits — but a job it's *already* mid-task on is allowed to finish first, so pausing never abandons in-flight work. The production worker's self-reschedule step also checks the flag before dispatching its next run, so a paused system doesn't quietly relaunch itself 2 minutes later. The orchestrator checks the flag first thing each cycle and does nothing at all — no launching, no stopping — while paused.
+
+**This is independent of, and faster than, disabling workflows on GitHub.** No token, no GitHub UI, no waiting on anyone — it's one API call you can make yourself from anywhere (a phone browser, curl, Kaggle, whatever's on hand), and workers already notice it within one poll cycle (a few seconds to tens of seconds), not whenever someone next checks GitHub. Disabling workflows via GitHub (what was used during the emergency stop that prompted this) is still worth knowing as a second, more absolute layer — it works even if the API or database itself is the thing misbehaving — but for ordinary "stop everything right now" situations, `/control/pause` is the first thing to reach for.
+
 ## Phase 2C — worker orchestration
 
 Run `schema_phase2c_orchestrator.sql` once (after the Phase 2A migration), then add `orchestrated-worker.yml` and `orchestrator.yml` are already set up to run on their own — no new secrets needed, since the orchestrator reuses the same built-in `secrets.GITHUB_TOKEN` mechanism already proven by the self-rescheduling worker, with `permissions: actions: write` granting it the right to dispatch new runs and cancel specific ones.

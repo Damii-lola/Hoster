@@ -160,9 +160,21 @@ def log_decision(conn, model_name, pending_jobs, committed_count, desired, actio
         )
 
 
+def is_paused(conn):
+    with conn.cursor() as cur:
+        cur.execute("SELECT paused, reason FROM system_control WHERE id = 1")
+        row = cur.fetchone()
+        return (row["paused"], row["reason"]) if row else (False, None)
+
+
 def main():
     conn = get_connection()
     try:
+        paused, reason = is_paused(conn)
+        if paused:
+            print(f"Kill switch is engaged ({reason or 'no reason given'}) — "
+                  f"orchestrator doing nothing this cycle.")
+            return
         models = fetch_relevant_models(conn)
     finally:
         conn.close()

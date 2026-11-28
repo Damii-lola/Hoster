@@ -261,6 +261,63 @@ def orchestrator_log():
     return jsonify(decisions=rows)
 
 
+@app.post("/control/pause")
+def pause_system():
+    """The actual kill switch. Flips a single DB flag that every worker
+    and the orchestrator check for themselves — no GitHub token needed,
+    no waiting on anyone. A worker already mid-job finishes that one
+    job (so nothing already in flight is abruptly lost) but will not
+    claim another, and will not reschedule itself. The orchestrator
+    will not launch or stop anything while paused."""
+    body = request.get_json(silent=True) or {}
+    reason = (body.get("reason") or "")[:255]
+
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE system_control SET paused = TRUE, reason = %s, "
+                "paused_at = NOW() WHERE id = 1",
+                (reason,),
+            )
+    finally:
+        conn.close()
+
+    return jsonify(paused=True, reason=reason)
+
+
+@app.post("/control/resume")
+def resume_system():
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE system_control SET paused = FALSE, resumed_at = NOW() WHERE id = 1"
+            )
+    finally:
+        conn.close()
+
+    return jsonify(paused=False)
+
+
+@app.get("/control/status")
+def control_status():
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM system_control WHERE id = 1")
+            row = cur.fetchone()
+    finally:
+        conn.close()
+
+    if row:
+        for k in ("paused_at", "resumed_at"):
+            if row.get(k) is not None:
+                row[k] = str(row[k])
+
+    return jsonify(row or {"paused": False})
+
+
 @app.get("/health")
 def health():
     conn = get_connection()

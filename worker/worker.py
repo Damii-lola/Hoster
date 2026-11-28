@@ -247,6 +247,13 @@ def _mark_stale_workers_offline(conn):
         )
 
 
+def _is_paused(conn):
+    with conn.cursor() as cur:
+        cur.execute("SELECT paused FROM system_control WHERE id = 1")
+        row = cur.fetchone()
+        return bool(row and row["paused"])
+
+
 def _reclaim_stale_jobs(conn):
     with conn.cursor() as cur:
         cur.execute(
@@ -447,6 +454,12 @@ def main():
             elapsed = time.time() - start_time
             if elapsed > MAX_RUNTIME_SECONDS - SHUTDOWN_MARGIN_SECONDS:
                 print(f"[{WORKER_ID}] approaching time budget, shutting down", flush=True)
+                break
+
+            if _run(_is_paused):
+                print(f"[{WORKER_ID}] system paused via kill switch — not claiming new "
+                      f"work, shutting down (this will also stop this worker's "
+                      f"self-reschedule, if any)", flush=True)
                 break
 
             _run(_reclaim_stale_jobs)
