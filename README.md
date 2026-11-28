@@ -64,6 +64,51 @@ If that works, the core loop is proven and we move on to:
 - quantizing/benchmarking the model properly,
 - and the monitoring/security layers we discussed.
 
+## Phase 3A — model registry (fine-tuned models)
+
+Run `schema_phase3_model_registry.sql` once (any time after `schema.sql`). This adds `base_models` (the small, manually-curated catalog of base models Hoster knows how to run — currently just `Qwen/Qwen2.5-7B-Instruct`, verified) and `models` (your actual registered fine-tunes).
+
+**The core rule, worth repeating because it drives everything else:** the `name` you choose when registering becomes the real `model_name` used everywhere from that point on — in `/run-ai` calls, in what a worker is told to load, in orchestration decisions. Never the raw base model string. That's deliberate: two different fine-tunes of the same base model need to be addressable separately, and reusing the base model's own name as the identifier would make that impossible.
+
+```bash
+# Register a fine-tune
+curl -X POST https://hoster-iwfv.onrender.com/models/register \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "my-support-bot-v1",
+    "base_model": "Qwen/Qwen2.5-7B-Instruct",
+    "adapter_repo_url": "https://github.com/you/your-adapter-repo",
+    "adapter_subpath": "model",
+    "input_type": "text",
+    "output_type": "text"
+  }'
+# -> {"id": "...", "name": "my-support-bot-v1", "status": "registered"}
+
+# See it, with live usage stats computed straight from the jobs table
+curl https://hoster-iwfv.onrender.com/models/my-support-bot-v1
+
+# List everything registered
+curl https://hoster-iwfv.onrender.com/models
+
+# Update it (changing base_model/adapter_repo_url/adapter_subpath resets status to 'registered' — the old prepared artifact, if any, no longer matches)
+curl -X PATCH https://hoster-iwfv.onrender.com/models/my-support-bot-v1 \
+  -H "Content-Type: application/json" -d '{"adapter_repo_url": "https://github.com/you/new-repo"}'
+
+# Delete it (job history under this name is left alone — this only removes the registration itself)
+curl -X DELETE https://hoster-iwfv.onrender.com/models/my-support-bot-v1 \
+  -H "Content-Type: application/json" -d '{"confirm": true}'
+```
+
+**What `GET /models/<name>` actually returns**, matching what was asked for: `status` (`registered` → `preparing` → `ready`/`failed`, plus `status_detail` explaining *why* if failed), the base model and adapter link it's configured with, declared `input_type`/`output_type`, and a live `usage` block — `total_calls`, `successful`, `failed`, `in_flight`, `success_rate_pct`, `avg_inference_seconds`, `last_used_at` — computed fresh from the `jobs` table every time, never a stored counter that could drift from what actually happened.
+
+**What this phase does NOT include yet — honestly, not quietly:**
+- **No automatic preparation pipeline.** Registering a model files it with `status: registered` — nothing downloads the adapter, converts it, or tests it yet. That's the very next piece: a dedicated process that takes a `registered` model, does the LoRA→GGUF conversion (verified working — see below), test-loads it, and flips status to `ready` or `failed`.
+- **`/run-ai` does not yet check the registry.** Submitting a job with a given `model_name` still works exactly as before, with no lookup against `models` — so the existing stock-Qwen flow is completely unaffected by this phase. Wiring job submission to require a `ready` registered model is part of the next step, not this one.
+- **Only `Qwen/Qwen2.5-7B-Instruct` is in `base_models`.** `Qwen2.5-VL-3B-Instruct` and any other vision-language model are deliberately excluded — they need a different execution backend (likely `transformers`+`peft` directly, not `llama.cpp`), which hasn't been attempted yet. Registering a fine-tune against an unlisted base model is rejected with a clear error, not silently accepted and left to fail later.
+- **`input_type`/`output_type` are declared metadata right now, not enforced behavior.** A model registered with `output_type: image` doesn't make the API actually return images yet — non-text I/O handling is real future work (Phase 3D/3E territory), not something this phase pretends to already do.
+
+**Proven, for real, against an actual adapter:** the LoRA→GGUF conversion path for `Qwen/Qwen2.5-7B-Instruct` was tested end-to-end against a real registered fine-tune (28 transformer layers, rank 16, standard q/k/v/o attention target modules) and produced a valid, correctly-shaped GGUF LoRA file. That's the part of this whole idea that was most likely to simply not work — it does. What's not yet verified in a real environment: `llama-cpp-python`'s exact runtime API for loading that converted LoRA alongside its base model (the parameter name is `lora_path`, from stable library documentation, but hasn't been freshly confirmed the way the conversion itself was) — that confirmation happens naturally the first time the preparation pipeline actually runs inside a GitHub Actions worker, which has normal internet access this sandbox doesn't.
+
 ## Kill switch
 
 Run `schema_phase2d_kill_switch.sql` once (any time after `schema.sql`). This adds a single-row `system_control` table with one `paused` flag, and three endpoints:

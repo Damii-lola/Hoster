@@ -318,6 +318,205 @@ def control_status():
     return jsonify(row or {"paused": False})
 
 
+@app.post("/models/register")
+def register_model():
+    """Register a fine-tuned model. `name` is yours to choose, and
+    becomes the model_name used everywhere from here on (job
+    submissions, worker assignment, orchestration) — never the raw
+    base model string, specifically so two fine-tunes of the same base
+    never collide."""
+    body = request.get_json(silent=True) or {}
+    name = (body.get("name") or "").strip()
+    base_model = (body.get("base_model") or "").strip()
+    adapter_repo_url = (body.get("adapter_repo_url") or "").strip()
+    adapter_subpath = (body.get("adapter_subpath") or "").strip()
+    input_type = body.get("input_type", "text")
+    accepted_file_types = body.get("accepted_file_types")
+    output_type = body.get("output_type", "text")
+
+    if not name or not base_model or not adapter_repo_url:
+        return jsonify(error="name, base_model, and adapter_repo_url are required"), 400
+    if input_type not in ("text", "image", "audio", "file"):
+        return jsonify(error="input_type must be one of: text, image, audio, file"), 400
+    if output_type not in ("text", "image", "video", "audio", "integration"):
+        return jsonify(error="output_type must be one of: text, image, video, audio, integration"), 400
+
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1 FROM base_models WHERE name = %s", (base_model,))
+            if cur.fetchone() is None:
+                return jsonify(
+                    error=f"'{base_model}' is not a supported base model. "
+                          f"GET /base-models for the current list."
+                ), 400
+
+            cur.execute("SELECT 1 FROM models WHERE name = %s", (name,))
+            if cur.fetchone() is not None:
+                return jsonify(error=f"a model named '{name}' is already registered"), 409
+
+            model_id = str(uuid.uuid4())
+            cur.execute(
+                "INSERT INTO models (id, name, base_model, adapter_repo_url, adapter_subpath, "
+                "input_type, accepted_file_types, output_type) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
+                (model_id, name, base_model, adapter_repo_url, adapter_subpath,
+                 input_type, accepted_file_types, output_type),
+            )
+    finally:
+        conn.close()
+
+    return jsonify(id=model_id, name=name, status="registered"), 201
+
+
+@app.get("/base-models")
+def list_base_models():
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM base_models")
+            rows = cur.fetchall()
+    finally:
+        conn.close()
+    return jsonify(base_models=rows)
+
+
+def _model_with_stats(conn, row):
+    """Merge a models row with live usage stats computed straight from
+    the jobs table — never a stored counter that can drift from
+    reality, same principle as everything else in this system."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT COUNT(*) AS total_calls, "
+            "SUM(status = 'done') AS successful, "
+            "SUM(status = 'failed') AS failed, "
+            "SUM(status IN ('pending', 'processing')) AS in_flight, "
+            "AVG(inference_seconds) AS avg_inference_seconds, "
+            "MAX(created_at) AS last_used_at "
+            "FROM jobs WHERE model_name = %s",
+            (row["name"],),
+        )
+        stats = cur.fetchone()
+
+    total = stats["total_calls"] or 0
+    successful = stats["successful"] or 0
+    row["usage"] = dict(
+        total_calls=total,
+        successful=successful,
+        failed=stats["failed"] or 0,
+        in_flight=stats["in_flight"] or 0,
+        success_rate_pct=round(successful / total * 100, 1) if total else None,
+        avg_inference_seconds=round(stats["avg_inference_seconds"], 2) if stats["avg_inference_seconds"] else None,
+        last_used_at=str(stats["last_used_at"]) if stats["last_used_at"] else None,
+    )
+    for k in ("created_at", "updated_at"):
+        if row.get(k) is not None:
+            row[k] = str(row[k])
+    return row
+
+
+@app.get("/models")
+def list_models():
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM models ORDER BY created_at DESC")
+            rows = cur.fetchall()
+        rows = [_model_with_stats(conn, r) for r in rows]
+    finally:
+        conn.close()
+    return jsonify(models=rows)
+
+
+@app.get("/models/<id_or_name>")
+def get_model(id_or_name):
+    """Look up by id or by the chosen name, either works."""
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT * FROM models WHERE id = %s OR name = %s", (id_or_name, id_or_name)
+            )
+            row = cur.fetchone()
+        if row is None:
+            return jsonify(error="model not found"), 404
+        row = _model_with_stats(conn, row)
+    finally:
+        conn.close()
+    return jsonify(row)
+
+
+@app.patch("/models/<id_or_name>")
+def update_model(id_or_name):
+    """Updating base_model, adapter_repo_url, or adapter_subpath
+    invalidates whatever was previously prepared — this isn't just a
+    metadata edit, the old converted artifact (if any) no longer
+    matches, so status resets to 'registered' and must go through
+    preparation again before it's usable."""
+    body = request.get_json(silent=True) or {}
+
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT * FROM models WHERE id = %s OR name = %s", (id_or_name, id_or_name)
+            )
+            row = cur.fetchone()
+            if row is None:
+                return jsonify(error="model not found"), 404
+
+            fields, values = [], []
+            invalidating = False
+            for key in ("base_model", "adapter_repo_url", "adapter_subpath"):
+                if key in body:
+                    fields.append(f"{key} = %s")
+                    values.append(body[key])
+                    invalidating = True
+            for key in ("input_type", "accepted_file_types", "output_type"):
+                if key in body:
+                    fields.append(f"{key} = %s")
+                    values.append(body[key])
+
+            if not fields:
+                return jsonify(error="no recognized fields to update"), 400
+
+            if invalidating:
+                fields += ["status = 'registered'", "status_detail = NULL", "lora_gguf_url = NULL"]
+
+            values.append(row["id"])
+            cur.execute(f"UPDATE models SET {', '.join(fields)} WHERE id = %s", values)
+    finally:
+        conn.close()
+
+    return jsonify(id=row["id"], name=row["name"], updated=True, reset_to_registered=invalidating)
+
+
+@app.delete("/models/<id_or_name>")
+def delete_model(id_or_name):
+    """Removes the registration entirely — the adapter link, base
+    model assignment, and converted artifact reference are gone. Past
+    job history under this model's name is left alone (it's a record
+    of what happened, not a pointer to something that must still
+    exist); only NEW submissions under this name will start failing,
+    since there's no longer a registered model to resolve it to.
+    Requires {"confirm": true} since this can't be undone from here."""
+    body = request.get_json(silent=True) or {}
+    if body.get("confirm") is not True:
+        return jsonify(error='pass {"confirm": true} in the request body to actually delete'), 400
+
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM models WHERE id = %s OR name = %s", (id_or_name, id_or_name))
+            deleted = cur.rowcount
+    finally:
+        conn.close()
+
+    if not deleted:
+        return jsonify(error="model not found"), 404
+    return jsonify(deleted=True)
+
+
 @app.get("/health")
 def health():
     conn = get_connection()
